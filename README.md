@@ -3,7 +3,7 @@
 Скрипт для обхода FTP-серверов и получения списка, хранящихся на них
 файлов.
 
-```usage: FTPripper.py [-h] [-v] -m {host,file,nmap} [-p PORT] [-t THREADS]
+```usage: FTPripper.py [-h] [-m {host,file,nmap}] [-p PORT] [-t THREADS]
                     [--timeout TIMEOUT]
                     input output
 
@@ -15,7 +15,6 @@ positional arguments:
 
 optional arguments:
   -h, --help            show this help message and exit
-  -v, --verbose         verbose mode
   -m {host,file,nmap}, --mode {host,file,nmap}
                         input type
   -p PORT, --port PORT  port number
@@ -28,7 +27,7 @@ optional arguments:
 
 * Обход одного FTP-сервера
 
-python3 FTPripper.py -m host 198.115.143.200 out.txt
+python3 FTPripper.py 198.115.143.200 out.txt
 
 * Обход FTP-серверов, перечисленных в файле ftp.txt
 

@@ -4,9 +4,11 @@ import concurrent.futures
 import datetime
 import ftplib
 import pathlib
+import re
 import signal
 import time
 import threading
+import urllib.parse
 import xml.etree.ElementTree as et
 
 
@@ -20,7 +22,10 @@ BANNER = """
 |_|     |_| |_|   |_|  |_| .__/| .__/ \___|_|   
                          |_|   |_|              
 """
-
+PROGRESS_MSG = 'Working with {}:{} server. {} directory left, {} files found.'
+DONE_MSG = 'Done with {}:{} server. {} files found.'
+ERROR_MSG = 'Error on {}:{} server. {}'
+STOP_MSG = 'Stopped working with {}:{} server.'
 
 # Исключение которое выбрасывается если программа не
 # может определить тип (файл или каталог) по строке,
@@ -33,16 +38,16 @@ class FtpStringException(Exception):
     def __str__(self):
         return 'Unsupported string format: ' + self.string
 
+def signal_handler(signum, frame):
+    print('\nStopping...')
+    STOP_EVENT.set()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Get list of files from FTP servers')
-    parser.add_argument('-v', '--verbose',
-        help='verbose mode',
-        action='store_true')
     parser.add_argument('-m', '--mode', 
         help='input type',
         choices=['host', 'file', 'nmap'],
-        required=True)
+        default='host')
     parser.add_argument('-p', '--port',
         help='port number',
         type=int,
@@ -60,6 +65,56 @@ def parse_args():
     parser.add_argument('output',
         help='path to save list of files')
     return parser.parse_args()
+
+# Получение алреса хоста и порта из строки
+# Аргументы: string - строка, default_port - номер порта по-умолчанию,
+# который используется, если порт не указан явно
+def get_host_from_sting(string, default_port):
+    pattern = re.compile(r'(?P<host>[\d\w.]+)(:(?P<port>[\d]+))?')
+    match = pattern.fullmatch(string)
+    if match:
+        if match.group('port'):
+            host = (match.group('host'), int(match.group('port')))
+        else:
+            host = (match.group('host'), default_port)
+    else:
+        host = None
+    return host
+
+# Чтение списка хостов из файла
+def get_hosts_from_file(filename, default_port):
+    hosts = []
+    with open(filename) as in_file:
+        for line in in_file:
+            host = get_host_from_sting(line.replace('\n', ''), default_port)
+            if host:
+                hosts.append(host)
+    return hosts
+
+# Получение списка хостов из XML файла с результатами
+# сканирования nmap (опция nmap -oX)
+def get_hosts_from_nmap_xml(filename):
+    tree = et.parse(filename)
+    hosts = tree.getroot().findall('.//host')
+    results = []
+    for host in hosts:
+        addr = host.find('address').attrib['addr']
+        ports = host.findall('./ports/port')
+        for port in ports:
+            portid = int(port.attrib['portid'])
+            state = port.find('./state').attrib['state']
+            service = port.find('./service').attrib['name']
+            if state == 'open' and service == 'ftp':
+                results.append((addr, portid))
+    return results
+
+# Функция вывода статистики, counter - объект collections.Counter
+def print_stats(counter):
+    print('Total: {} files'.format(sum((counter[key] for key in counter.keys()))))
+    for key in sorted([key for key in counter.keys() if key != '']):
+        print(' {}: {}'.format(key, counter[key]))
+    if '' in counter:
+        print(' Unknown files: {}'.format(counter['']))
 
 # Функция для получения списков файлов и директорий на FTP-сервере.
 # Аргументы: ftp - объект ftplib.FTP, path - путь до директори на сервере.
@@ -91,99 +146,53 @@ def get_content(ftp, path):
 # Аргументы: host - словарь, содержащий адрес и порт сервера,
 # args - аргументы командной строки.
 # Возвращает: список путей до файлов на FTP-сервере в формате
-# ftp://'хост':'порт'/'путь до файла' и список ошибок, полученных
-# при обходе сервера.
+# ftp://'хост':'порт'/'путь до файла'.
 def process_ftp(host, args):
     if STOP_EVENT.is_set():
-        return [], ['Stoped']
+        with LOCK:
+            print(STOP_MSG.format(host[0], host[1]))
+        return []
     ftp = ftplib.FTP(timeout=args.timeout)
-    ftp.connect(host['addr'], port=host['port'])
+    ftp.connect(host[0], port=host[1])
     ftp.login()
-
-    if ftp.pwd() != '/':
+    # Определение начальной директории
+    try:
+        ftp.cwd('/')
+    except ftplib.error_perm:
         dirs = ['']
-        template = 'ftp://{}:{}/{}'
     else:
         dirs = ['/']
-        template = 'ftp://{}:{}{}'
-
     files = []
-    errors = []
+    # Обход директорий на сервере
     while dirs:
         if STOP_EVENT.is_set():
-            errors.append('Stoped')
+            with LOCK:
+                print(STOP_MSG.format(host[0], host[1]))
             break
+        with LOCK:
+            print(PROGRESS_MSG.format(host[0], host[1], len(dirs), len(files)))
         path = dirs[0]
         try:
-            if args.verbose:
-                with LOCK:
-                    print('Getting content from '+template.format(host['addr'], host['port'], path))
             new_dirs, new_files = get_content(ftp, path)
-        except ftplib.error_perm as e:
+        # Пропуск директрий с ошибками
+        except ftplib.error_perm:
             dirs.pop(0)
-            errors.append('{}:{} Path: {} Error: {}'.format(host['addr'], host['port'], path, e))
             continue
-        files += [template.format(host['addr'], host['port'], f) for f in new_files]
+        files += new_files
         dirs.pop(0)
         dirs = new_dirs + dirs
-
     ftp.close()
-    return files, errors
-
-# Чтение списка хостов из файла
-def get_hosts_from_file(filename):
-    hosts = []
-    with open(filename) as in_file:
-        for line in in_file:
-            host = line[:-1]
-            if host:
-                host = host.split(':')
-                if len(host) == 1:
-                    hosts.append({'addr': host[0], 'port': None})
-                elif len(host) == 2:
-                    hosts.append({'addr': host[0], 'port': int(host[1])})
-    return hosts
-
-# Получение списка хостов из XML файла с результатами
-# сканирования nmap (опция nmap -oX)
-def get_hosts_from_nmap_xml(filename):
-    tree = et.parse(filename)
-    hosts = tree.getroot().findall('.//host')
-    results = []
-    for host in hosts:
-        addr = host.find('address').attrib['addr']
-        ports = host.findall('./ports/port')
-        for port in ports:
-            portid = port.attrib['portid']
-            state = port.find('./state').attrib['state']
-            service = port.find('./service').attrib['name']
-            if state == 'open' and service == 'ftp':
-                results.append({'addr': addr, 'port': int(portid)})
-    return results
-
-# Получение хоста из интерфейса командной строки,
-# формат 'хост':'порт'
-def get_host_from_cli(string):
-    host = string.split(':')
-    if len(host) == 1:
-        return [{'addr': host[0], 'port': None}]
-    elif len(host) == 2:
-        return [{'addr': host[0], 'port': int(host[1])}]
-    else:
-        return []
-
-# Функция вывода статистики, counter - объект collections.Counter
-def print_stats(counter):
-    print('Total: {} files'.format(sum((counter[key] for key in counter.keys()))))
-    for key in sorted([key for key in counter.keys() if key != '']):
-        print(' {}: {}'.format(key, counter[key]))
-    if '' in counter:
-        print(' Unknown files: {}'.format(counter['']))
+    for f in files:
+        if not f.startswith('/'):
+            f = '/' + f
+    with LOCK:
+        print(DONE_MSG.format(host[0], host[1], len(files)))
+    return files
 
 # Функция, выполняющая основную работу, отвечает за запуск пула потоков,
 # сбор статистики, вывод результатов.
-# Аргументы: hosts - список хостов, каждый хост - словарь с ключами
-# 'addr' и 'port', args - аргументы командной строки.
+# Аргументы: hosts - список хостов, каждый хост - tuple, содержащий
+# адрес и порт, args - аргументы командной строки.
 def do_work(hosts, args):
     total = collections.Counter() # Общая статистика по всем хостам
     out_file = open(args.output, 'w')
@@ -195,27 +204,20 @@ def do_work(hosts, args):
         # обход FTP-сервера
         futures = {executor.submit(process_ftp, host, args): host for host in hosts}
         for ft in concurrent.futures.as_completed(futures):
+            host = futures[ft]
             try:
-                files, errors = ft.result()
+                files= ft.result()
             except Exception as e:
-                print('{}:{} {}'.format(futures[ft]['addr'], futures[ft]['port'], e))
-                print('='*60)
+                with LOCK:
+                    print(ERROR_MSG.format(host[0], host[1], e))
                 continue
-            print('Done with {}:{}'.format(futures[ft]['addr'], futures[ft]['port']))
             for f in files:
-                out_file.write(f+'\n')
+                out_file.write('ftp://{}:{}{}\n'.format(host[0], host[1], urllib.parse.quote(f)))
 
             # Подсчёт статистики по хосту, подсчитывается кол-во файлов с различными
             # расширениями
             stats = collections.Counter([pathlib.Path(f).suffix for f in files])
             total += stats
-            print_stats(stats)
-
-            # Вывод ошибок полученных во время обхода FTP-сервера.
-            print('Errors: {}'.format(len(errors)))
-            for e in errors:
-                print(' {}'.format(e))
-            print('='*60)
 
     stop = int(time.time())
     print('Elasped time: {}'.format(datetime.timedelta(seconds=stop-start)))
@@ -223,29 +225,20 @@ def do_work(hosts, args):
     print_stats(total)
     out_file.close()
 
-def signal_handler(signum, frame):
-    print('\nStopping...')
-    STOP_EVENT.set()
-
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     args = parse_args()
     print(BANNER)
 
-    # Получение списка портов в зависимости от указанного
+    # Получение списка хостов в зависимости от указанного
     # опцией -m режима.
     if args.mode == 'file':
-        hosts = get_hosts_from_file(args.input)
+        hosts = get_hosts_from_file(args.input, args.port)
     elif args.mode == 'nmap':
         hosts = get_hosts_from_nmap_xml(args.input)
     else:
-        hosts = get_host_from_cli(args.input)
+        hosts = [get_host_from_sting(args.input, args.port)]
 
-    # Если номер порта явно не указан, выбирается порт из
-    # args.port (по-умолчанию 21).
-    for host in hosts:
-        if host['port'] == None:
-            host['port'] = args.port
     do_work(hosts, args)
 
 
